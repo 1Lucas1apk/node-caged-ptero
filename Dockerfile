@@ -20,7 +20,7 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
   zip \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g --no-audit --no-fund typescript ts-node \
+RUN npm install -g --no-audit --no-fund typescript ts-node pnpm@12.23.0 \
   && npm cache clean --force
 
 RUN useradd -m -d /home/container -s /bin/bash -U -u 1000 container \
