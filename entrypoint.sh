@@ -11,7 +11,7 @@ export npm_config_cache="${npm_config_cache:-${NPM_CONFIG_CACHE}}"
 mkdir -p "${NPM_CONFIG_CACHE}" "${NPM_CONFIG_CACHE}/_logs" 2>/dev/null || true
 chmod -R u+rwX "${NPM_CONFIG_CACHE}" 2>/dev/null || true
 
-INTERNAL_IP="$(ip route get 1 2>/dev/null | awk '{print $(NF-2);exit}')"
+INTERNAL_IP="$(ip route get 1 2>/dev/null | awk '{print $(NF-2);exit}' || true)"
 export INTERNAL_IP
 
 add_preload_lib() {
@@ -110,7 +110,7 @@ has_node_option() {
 
 if [ "${AUTO_TUNE_NODE_MEMORY:-false}" = "true" ]; then
   if [[ ! " ${NODE_OPTIONS:-} " =~ [[:space:]]--max-old-space-size(=|[[:space:]]) ]] && \
-    [[ ! " ${NODE_OPTIONS:-} " =~ [[:space:]]--max-old-space-size-percentage(=|[[:space:]]) ]]; then
+     [[ ! " ${NODE_OPTIONS:-} " =~ [[:space:]]--max-old-space-size-percentage(=|[[:space:]]) ]]; then
     HEAP_MB="$(node /cgroup-memory.cjs --heap)"
 
     if [[ "${HEAP_MB}" =~ ^[1-9][0-9]*$ ]]; then

@@ -23,9 +23,18 @@ const heapPressureHigh = decimal('PERIODIC_GC_HEAP_PRESSURE_HIGH', 0.9, 0.5, 0.9
 const cooldownMs = integer('PERIODIC_GC_COOLDOWN_MS', 180000, 10000, 86_400_000);
 const includeWorkers = String(process.env.PERIODIC_GC_INCLUDE_WORKERS || 'false') === 'true';
 const shouldLog = String(process.env.PERIODIC_GC_LOG || 'false') === 'true';
+const rootPidVariable = 'NODE_CAGED_PTERO_GC_ROOT_PID';
+const inheritedRootPid = process.env[rootPidVariable];
 
 if (mode !== 'adaptive' && mode !== 'always') {
   if (shouldLog) console.log(`[memory-tune] disabled: unsupported mode "${mode}"`);
+  return;
+}
+
+// NODE_OPTIONS is inherited by child Node.js processes. Only the original
+// process should own the timer, unless a separate Worker policy is requested.
+if (inheritedRootPid && inheritedRootPid !== String(process.pid)) {
+  if (shouldLog) console.log('[memory-tune] skipped: child Node.js process');
   return;
 }
 
@@ -44,6 +53,8 @@ const policy = createMemoryPolicy({
   heapPressureHigh,
   consecutiveSamples
 });
+
+process.env[rootPidVariable] = String(process.pid);
 
 let lastForcedGcAt = 0;
 
