@@ -34,6 +34,9 @@ ENV USER=container \
   npm_config_update_notifier=false \
   npm_config_fund=false \
   npm_config_audit=false \
+  MEMORY_ALLOCATOR=auto \
+  ENABLE_JEMALLOC=false \
+  MALLOC_CONF=background_thread:true,narenas:2,dirty_decay_ms:5000,muzzy_decay_ms:5000 \
   AUTO_TUNE_NODE_MEMORY=false \
   NODE_HEAP_RATIO=60 \
   NODE_HEAP_RESERVE_MB=128 \
@@ -62,4 +65,4 @@ USER container
 STOPSIGNAL SIGINT
 
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
-CMD["/entrypoint.sh"]
+CMD ["/entrypoint.sh"]
