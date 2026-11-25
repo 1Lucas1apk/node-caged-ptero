@@ -1,4 +1,4 @@
-FROM platformatic/node-caged:25-slim
+FROM platformatic/node-caged:26-slim
 
 RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \
   bash \
@@ -10,7 +10,7 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
   iproute2 \
   iputils-ping \
   libjemalloc2 \
-  libmimalloc2.0 \
+  libmimalloc3 \
   libnss3 \
   python3 \
   sqlite3 \
@@ -20,10 +20,12 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
   zip \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g --no-audit --no-fund npm@latest typescript ts-node \
+RUN npm install -g --no-audit --no-fund typescript ts-node pnpm@12.23.0 \
   && npm cache clean --force
 
-RUN useradd -m -d /home/container -s /bin/bash -U -u 1000 container && mkdir -p /home/container /home/container/.npm && chown -R container:container /home/container
+RUN useradd -m -d /home/container -s /bin/bash -U -u 1000 container \
+  && mkdir -p /home/container /home/container/.npm \
+  && chown -R container:container /home/container
 
 ENV USER=container \
   HOME=/home/container \
@@ -32,32 +34,35 @@ ENV USER=container \
   npm_config_update_notifier=false \
   npm_config_fund=false \
   npm_config_audit=false \
-  MALLOC_ARENA_MAX=2 \
-  MEMORY_ALLOCATOR=jemalloc \
-  ENABLE_JEMALLOC=true \
-  MALLOC_CONF=background_thread:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:1000 \
+  MEMORY_ALLOCATOR=auto \
+  ENABLE_JEMALLOC=false \
+  MALLOC_CONF=background_thread:true,narenas:2,dirty_decay_ms:5000,muzzy_decay_ms:5000 \
   AUTO_TUNE_NODE_MEMORY=false \
-  NODE_HEAP_RATIO=65 \
-  NODE_HEAP_MIN_MB=128 \
-  ENABLE_PERIODIC_GC=true \
+  NODE_HEAP_RATIO=60 \
+  NODE_HEAP_RESERVE_MB=128 \
+  NODE_HEAP_MIN_MB=64 \
+  ENABLE_PERIODIC_GC=false \
   PERIODIC_GC_MODE=adaptive \
   PERIODIC_GC_INTERVAL_MS=60000 \
-  PERIODIC_GC_MAX_RSS_MB=0 \
-  PERIODIC_GC_MIN_RSS_GROWTH_MB=24 \
-  PERIODIC_GC_MIN_HEAP_DELTA_MB=4 \
-  PERIODIC_GC_HEAP_PRESSURE_HIGH=0.82 \
-  PERIODIC_GC_COOLDOWN_MS=45000 \
-  PERIODIC_GC_LOG=false
+  PERIODIC_GC_CONSECUTIVE_SAMPLES=3 \
+  PERIODIC_GC_HEAP_PRESSURE_HIGH=0.9 \
+  PERIODIC_GC_COOLDOWN_MS=180000 \
+  PERIODIC_GC_INCLUDE_WORKERS=false \
+  PERIODIC_GC_LOG=false \
+  MEMORY_DIAGNOSTICS=false
 
 WORKDIR /home/container
 
 COPY --chown=container:container entrypoint.sh /entrypoint.sh
+COPY --chown=container:container cgroup-memory.cjs /cgroup-memory.cjs
+COPY --chown=container:container memory-policy.cjs /memory-policy.cjs
 COPY --chown=container:container memory-tune.cjs /memory-tune.cjs
-RUN chmod 755 /entrypoint.sh && chmod 644 /memory-tune.cjs
+RUN chmod 755 /entrypoint.sh \
+  && chmod 644 /cgroup-memory.cjs /memory-policy.cjs /memory-tune.cjs
 
 USER container
 
 STOPSIGNAL SIGINT
 
-ENTRYPOINT ["/usr/bin/tini","-g","--"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["/entrypoint.sh"]

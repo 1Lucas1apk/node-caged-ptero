@@ -11,7 +11,7 @@ export npm_config_cache="${npm_config_cache:-${NPM_CONFIG_CACHE}}"
 mkdir -p "${NPM_CONFIG_CACHE}" "${NPM_CONFIG_CACHE}/_logs" 2>/dev/null || true
 chmod -R u+rwX "${NPM_CONFIG_CACHE}" 2>/dev/null || true
 
-INTERNAL_IP="$(ip route get 1 2>/dev/null | awk '{print $(NF-2);exit}')"
+INTERNAL_IP="$(ip route get 1 2>/dev/null | awk '{print $(NF-2);exit}' || true)"
 export INTERNAL_IP
 
 add_preload_lib() {
@@ -19,73 +19,75 @@ add_preload_lib() {
   export LD_PRELOAD="${lib}${LD_PRELOAD:+:${LD_PRELOAD}}"
 }
 
-find_first_lib() {
-  local path
-  for path in "$@"; do
-    if [ -r "${path}" ]; then
-      echo "${path}"
-      return 0
-    fi
-  done
-  return 1
+find_allocator_library() {
+  local soname_prefix="$1"
+  ldconfig -p 2>/dev/null | awk -v prefix="${soname_prefix}" \
+    '$1 ~ ("^" prefix "\\.so\\.[0-9]+$") { print $NF; exit }'
+}
+
+verify_allocator_preload() {
+  node -e '
+    const fs = require("node:fs")
+    const markers = { jemalloc: "libjemalloc.so.", mimalloc: "libmimalloc.so." }
+    const marker = markers[process.env.MEMORY_ALLOCATOR_SELECTED]
+    if (!marker || !fs.readFileSync("/proc/self/maps", "utf8").includes(marker)) process.exit(1)
+  ' || {
+    echo "ERROR: ${MEMORY_ALLOCATOR_SELECTED} was selected but is not mapped in the Node.js process." >&2
+    return 1
+  }
 }
 
 select_allocator() {
-  local requested allocator mimalloc_lib jemalloc_lib
+  local requested allocator library
   requested="${MEMORY_ALLOCATOR:-auto}"
   allocator="${requested,,}"
 
-  mimalloc_lib="$(find_first_lib \
-    /usr/lib/x86_64-linux-gnu/libmimalloc.so.2 \
-    /usr/lib/x86_64-linux-gnu/libmimalloc.so.2.0 \
-    /usr/lib/libmimalloc.so.2 \
-    /usr/lib/libmimalloc.so.2.0 \
-  )" || true
-
-  jemalloc_lib="$(find_first_lib \
-    /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-    /usr/lib/libjemalloc.so.2 \
-  )" || true
-
+  # ENABLE_JEMALLOC is retained for compatibility with existing panel variables.
   if [ "${allocator}" = "auto" ]; then
-    allocator="jemalloc"
-  fi
-
-  if [ "${allocator}" = "mimalloc" ]; then
-    if [ -n "${mimalloc_lib}" ]; then
-      add_preload_lib "${mimalloc_lib}"
-      echo "Memory allocator: mimalloc enabled"
-      return 0
+    if [ "${ENABLE_JEMALLOC:-false}" = "true" ]; then
+      allocator="jemalloc"
+    else
+      allocator="glibc"
     fi
-    echo "Memory allocator: mimalloc requested but library not found, trying jemalloc"
-    allocator="jemalloc"
   fi
 
-  if [ "${allocator}" = "jemalloc" ]; then
-    if [ -n "${jemalloc_lib}" ]; then
-      add_preload_lib "${jemalloc_lib}"
-      echo "Memory allocator: jemalloc enabled"
-      return 0
-    fi
-    echo "Memory allocator: jemalloc requested but library not found"
-    return 1
-  fi
-
-  if [ "${allocator}" = "none" ]; then
-    echo "Memory allocator: default glibc"
-    return 0
-  fi
-
-  echo "Memory allocator: unknown MEMORY_ALLOCATOR='${requested}', using default glibc"
-  return 0
+  case "${allocator}" in
+    glibc|none)
+      export MEMORY_ALLOCATOR_SELECTED="glibc"
+      echo "Memory allocator: glibc"
+      ;;
+    jemalloc)
+      library="$(find_allocator_library 'libjemalloc')"
+      if [ -z "${library}" ] || [ ! -r "${library}" ]; then
+        echo "ERROR: jemalloc was requested but libjemalloc was not found." >&2
+        return 1
+      fi
+      add_preload_lib "${library}"
+      export MEMORY_ALLOCATOR_SELECTED="jemalloc"
+      export MEMORY_ALLOCATOR_LIBRARY="${library}"
+      verify_allocator_preload || return 1
+      echo "Memory allocator: jemalloc (${library}) loaded"
+      ;;
+    mimalloc)
+      library="$(find_allocator_library 'libmimalloc')"
+      if [ -z "${library}" ] || [ ! -r "${library}" ]; then
+        echo "ERROR: mimalloc was requested but libmimalloc was not found." >&2
+        return 1
+      fi
+      add_preload_lib "${library}"
+      export MEMORY_ALLOCATOR_SELECTED="mimalloc"
+      export MEMORY_ALLOCATOR_LIBRARY="${library}"
+      verify_allocator_preload || return 1
+      echo "Memory allocator: mimalloc (${library}) loaded"
+      ;;
+    *)
+      echo "ERROR: unsupported MEMORY_ALLOCATOR='${requested}'. Use auto, glibc, jemalloc or mimalloc." >&2
+      return 1
+      ;;
+  esac
 }
 
-# Backward compatibility for older deployments.
-if [ "${MEMORY_ALLOCATOR:-auto}" = "auto" ] && [ "${ENABLE_JEMALLOC:-true}" = "true" ]; then
-  MEMORY_ALLOCATOR="jemalloc"
-fi
-
-select_allocator || true
+select_allocator
 
 echo "Node.js Version: $(node -v)"
 
@@ -101,48 +103,43 @@ if [ "${YOLK_EOL_NAG_WARNING+x}" ]; then
   sleep "${YOLK_EOL_NAG_DELAY:-10}"
 fi
 
-if [ "${AUTO_TUNE_NODE_MEMORY:-true}" = "true" ]; then
-  if [[ "${NODE_OPTIONS:-}" != *"--max-old-space-size="* ]]; then
-    CGROUP_LIMIT_BYTES=""
+has_node_option() {
+  local option="$1"
+  [[ " ${NODE_OPTIONS:-} " =~ [[:space:]]${option}([=]|[[:space:]]|$) ]]
+}
 
-    if [ -r /sys/fs/cgroup/memory.max ]; then
-      CGROUP_LIMIT_BYTES="$(cat /sys/fs/cgroup/memory.max)"
-      if [ "${CGROUP_LIMIT_BYTES}" = "max" ]; then
-        CGROUP_LIMIT_BYTES=""
-      fi
-    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-      CGROUP_LIMIT_BYTES="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
-      if [ "${CGROUP_LIMIT_BYTES}" -ge 9223372036850000000 ] 2>/dev/null; then
-        CGROUP_LIMIT_BYTES=""
-      fi
+if [ "${AUTO_TUNE_NODE_MEMORY:-false}" = "true" ]; then
+  if [[ ! " ${NODE_OPTIONS:-} " =~ [[:space:]]--max-old-space-size(=|[[:space:]]) ]] && \
+     [[ ! " ${NODE_OPTIONS:-} " =~ [[:space:]]--max-old-space-size-percentage(=|[[:space:]]) ]]; then
+    HEAP_MB="$(node /cgroup-memory.cjs --heap)"
+
+    if [[ "${HEAP_MB}" =~ ^[1-9][0-9]*$ ]]; then
+      export NODE_OPTIONS="--max-old-space-size=${HEAP_MB}${NODE_OPTIONS:+ ${NODE_OPTIONS}}"
+      echo "Auto heap tuning: old-space=${HEAP_MB} MiB (per V8 isolate)"
+    else
+      echo "Auto heap tuning: no safe finite budget found; leaving Node.js defaults"
     fi
-
-    if [ -n "${CGROUP_LIMIT_BYTES}" ] && [ "${CGROUP_LIMIT_BYTES}" -gt 0 ] 2>/dev/null; then
-      LIMIT_MB="$((CGROUP_LIMIT_BYTES / 1024 / 1024))"
-      HEAP_RATIO="${NODE_HEAP_RATIO:-65}"
-      HEAP_MB="$((LIMIT_MB * HEAP_RATIO / 100))"
-      MIN_MB="${NODE_HEAP_MIN_MB:-128}"
-
-      if [ "${HEAP_MB}" -lt "${MIN_MB}" ]; then
-        HEAP_MB="${MIN_MB}"
-      fi
-
-      export NODE_OPTIONS="--max-old-space-size=${HEAP_MB} ${NODE_OPTIONS:-}"
-      echo "Auto heap tuning: cgroup=${LIMIT_MB}MB, old-space=${HEAP_MB}MB"
-    fi
+  else
+    echo "Auto heap tuning: explicit NODE_OPTIONS heap limit preserved"
   fi
 fi
 
+if [ "${MEMORY_DIAGNOSTICS:-false}" = "true" ]; then
+  echo "Container memory diagnostics:"
+  node /cgroup-memory.cjs
+fi
+
 if [ "${ENABLE_PERIODIC_GC:-false}" = "true" ]; then
-  if [[ "${NODE_OPTIONS:-}" != *"--expose-gc"* ]]; then
-    export NODE_OPTIONS="${NODE_OPTIONS:-} --expose-gc"
+  if ! has_node_option '--expose-gc'; then
+    export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--expose-gc"
   fi
 
-  if [[ "${NODE_OPTIONS:-}" != *"--require /memory-tune.cjs"* ]]; then
-    export NODE_OPTIONS="${NODE_OPTIONS:-} --require /memory-tune.cjs"
+  if [[ " ${NODE_OPTIONS:-} " != *"/memory-tune.cjs"* ]]; then
+    export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--require=/memory-tune.cjs"
   fi
 
   echo "GC helper enabled: mode=${PERIODIC_GC_MODE:-adaptive} interval=${PERIODIC_GC_INTERVAL_MS:-60000}ms"
+  echo "WARNING: forced GC is opt-in and may increase latency; NODE_OPTIONS also affects child Node.js processes."
 fi
 
 if [ -z "${STARTUP:-}" ]; then

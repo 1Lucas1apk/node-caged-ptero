@@ -1,86 +1,106 @@
 'use strict';
 
-function toInt(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
+const { isMainThread } = require('node:worker_threads');
+const v8 = require('node:v8');
+const { createMemoryPolicy } = require('/memory-policy.cjs');
+
+function integer(name, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(String(process.env[name] ?? ''), 10);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) return fallback;
+  return parsed;
 }
 
-function toFloat(value, fallback) {
-  const parsed = Number.parseFloat(String(value ?? ''));
-  return Number.isFinite(parsed) ? parsed : fallback;
+function decimal(name, fallback, minimum, maximum) {
+  const parsed = Number.parseFloat(String(process.env[name] ?? ''));
+  if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) return fallback;
+  return parsed;
 }
 
 const mode = String(process.env.PERIODIC_GC_MODE || 'adaptive').toLowerCase();
-const intervalMs = toInt(process.env.PERIODIC_GC_INTERVAL_MS, 60000);
-const rssThresholdMb = toInt(process.env.PERIODIC_GC_MAX_RSS_MB, 0);
-const minRssGrowthMb = toInt(process.env.PERIODIC_GC_MIN_RSS_GROWTH_MB, 24);
-const minHeapDeltaMb = toInt(process.env.PERIODIC_GC_MIN_HEAP_DELTA_MB, 4);
-const heapPressureHigh = toFloat(process.env.PERIODIC_GC_HEAP_PRESSURE_HIGH, 0.82);
-const cooldownMs = toInt(process.env.PERIODIC_GC_COOLDOWN_MS, 45000);
+const intervalMs = integer('PERIODIC_GC_INTERVAL_MS', 60000, 10000, 3_600_000);
+const consecutiveSamples = integer('PERIODIC_GC_CONSECUTIVE_SAMPLES', 3, 2, 100);
+const heapPressureHigh = decimal('PERIODIC_GC_HEAP_PRESSURE_HIGH', 0.9, 0.5, 0.99);
+const cooldownMs = integer('PERIODIC_GC_COOLDOWN_MS', 180000, 10000, 86_400_000);
+const includeWorkers = String(process.env.PERIODIC_GC_INCLUDE_WORKERS || 'false') === 'true';
 const shouldLog = String(process.env.PERIODIC_GC_LOG || 'false') === 'true';
+const rootPidVariable = 'NODE_CAGED_PTERO_GC_ROOT_PID';
+const inheritedRootPid = process.env[rootPidVariable];
 
-if (intervalMs < 10000) {
-  if (shouldLog) console.log('[memory-tune] disabled: interval too low');
+if (mode !== 'adaptive' && mode !== 'always') {
+  if (shouldLog) console.log(`[memory-tune] disabled: unsupported mode "${mode}"`);
+  return;
+}
+
+// NODE_OPTIONS is inherited by child Node.js processes. Only the original
+// process should own the timer, unless a separate Worker policy is requested.
+if (inheritedRootPid && inheritedRootPid !== String(process.pid)) {
+  if (shouldLog) console.log('[memory-tune] skipped: child Node.js process');
+  return;
+}
+
+if (!includeWorkers && !isMainThread) {
+  if (shouldLog) console.log('[memory-tune] skipped: worker thread');
   return;
 }
 
 if (typeof global.gc !== 'function') {
-  if (shouldLog) console.log('[memory-tune] disabled: global.gc unavailable');
+  if (shouldLog) console.log('[memory-tune] disabled: global.gc is unavailable');
   return;
 }
 
-let last = process.memoryUsage();
+const policy = createMemoryPolicy({
+  mode,
+  heapPressureHigh,
+  consecutiveSamples
+});
+
+process.env[rootPidVariable] = String(process.pid);
+
 let lastForcedGcAt = 0;
 
-setInterval(() => {
+const timer = setInterval(() => {
   const now = Date.now();
   if (now - lastForcedGcAt < cooldownMs) return;
 
-  const current = process.memoryUsage();
-  const rssMb = Math.round(current.rss / 1024 / 1024);
-  const heapUsedMb = Math.round(current.heapUsed / 1024 / 1024);
-  const heapTotalMb = Math.max(1, Math.round(current.heapTotal / 1024 / 1024));
-  const heapPressure = current.heapUsed / Math.max(1, current.heapTotal);
+  const memory = process.memoryUsage();
+  const heapLimit = v8.getHeapStatistics().heap_size_limit;
+  const decision = policy.evaluate({
+    heapUsed: memory.heapUsed,
+    heapLimit
+  });
 
-  if (rssThresholdMb > 0 && rssMb < rssThresholdMb) {
-    last = current;
-    return;
-  }
-
-  let shouldForceGc = false;
-  let reason = '';
-
-  if (mode === 'always') {
-    shouldForceGc = true;
-    reason = 'always';
-  } else {
-    const rssGrowthMb = Math.round((current.rss - last.rss) / 1024 / 1024);
-    const heapGrowthMb = Math.round((current.heapUsed - last.heapUsed) / 1024 / 1024);
-
-    if (heapPressure >= heapPressureHigh) {
-      shouldForceGc = true;
-      reason = `heap-pressure ${heapPressure.toFixed(2)}`;
-    } else if (rssGrowthMb >= minRssGrowthMb && heapGrowthMb <= minHeapDeltaMb) {
-      shouldForceGc = true;
-      reason = `rss-growth ${rssGrowthMb}MB heap-delta ${heapGrowthMb}MB`;
+  if (!decision.shouldCollect) {
+    if (shouldLog && decision.reason === 'awaiting-confirmation') {
+      console.log(
+        `[memory-tune] heap pressure ${(decision.pressure * 100).toFixed(1)}%; waiting for confirmation`
+      );
     }
-  }
-
-  if (!shouldForceGc) {
-    last = current;
     return;
   }
 
+  const before = process.memoryUsage();
+  const startedAt = performance.now();
   global.gc();
-  lastForcedGcAt = now;
+  const durationMs = performance.now() - startedAt;
+  const after = process.memoryUsage();
+  lastForcedGcAt = Date.now();
 
   if (shouldLog) {
-    const after = process.memoryUsage();
-    const afterRssMb = Math.round(after.rss / 1024 / 1024);
-    const afterHeapUsedMb = Math.round(after.heapUsed / 1024 / 1024);
     console.log(
-      `[memory-tune] forced gc (${reason}) rss=${rssMb}MB->${afterRssMb}MB heap=${heapUsedMb}/${heapTotalMb}MB->${afterHeapUsedMb}MB`
+      '[memory-tune] forced GC',
+      JSON.stringify({
+        reason: decision.reason,
+        heapPressure: decision.pressure ?? null,
+        durationMs: Number(durationMs.toFixed(2)),
+        rssBeforeMiB: Number((before.rss / 1048576).toFixed(1)),
+        rssAfterMiB: Number((after.rss / 1048576).toFixed(1)),
+        heapUsedBeforeMiB: Number((before.heapUsed / 1048576).toFixed(1)),
+        heapUsedAfterMiB: Number((after.heapUsed / 1048576).toFixed(1)),
+        externalMiB: Number((after.external / 1048576).toFixed(1)),
+        arrayBuffersMiB: Number((after.arrayBuffers / 1048576).toFixed(1))
+      })
     );
   }
-  last = process.memoryUsage();
-}, intervalMs).unref();
+}, intervalMs);
+
+timer.unref();
