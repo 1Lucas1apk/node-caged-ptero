@@ -36,7 +36,7 @@ test('parses cgroup v1 memory controller', () => {
 
 test('parses cgroup memberships for both versions', () => {
   assert.deepEqual(
-    parseCgroupMembership('0::/system.slice/container.scope\\n7:cpu,memory:/docker/abc'),
+    parseCgroupMembership('0::/system.slice/container.scope\n7:cpu,memory:/docker/abc'),
     { v2: '/system.slice/container.scope', v1Memory: '/docker/abc' }
   );
 });
