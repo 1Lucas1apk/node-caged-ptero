@@ -25,6 +25,8 @@ A forced full GC can introduce latency and does not fix retained references, nat
 | Variable | Default | Purpose |
 |---|---|---|
 | `MEMORY_ALLOCATOR` | `auto` | `auto`, `glibc`, `jemalloc`, or `mimalloc` |
+
+The image also installs `pnpm@12.23.0` globally, so NodeLink startup commands can call `pnpm` without relying on Corepack downloading it at runtime.
 | `ENABLE_JEMALLOC` | `false` | Legacy compatibility switch used only when allocator is `auto` |
 | `AUTO_TUNE_NODE_MEMORY` | `false` | Derive an old-space limit from effective container memory |
 | `NODE_HEAP_RATIO` | `60` | Maximum percentage of the effective limit eligible for old-space |
